@@ -19,7 +19,6 @@ _last_aria = None
 async def init_browser():
     global _playwright, _browser, _page
     _playwright = await async_playwright().start()
-    # Use headless=False for testing environments without X11
     _browser = await _playwright.chromium.launch_persistent_context(
         user_data_dir="/tmp/playwright_user_data",
         headless=False,
@@ -34,6 +33,9 @@ async def init_browser():
 async def get_aria_snapshot(page):
     js_script = """
     () => {
+        // Clear previous badges
+        document.querySelectorAll('.ai-som-badge').forEach(e => e.remove());
+
         const interactiveElements = Array.from(document.querySelectorAll('a, button, input, select, textarea, [role="button"], [role="link"], [role="checkbox"], [tabindex]:not([tabindex="-1"])'));
         let result = [];
         let index = 1;
@@ -49,8 +51,24 @@ async def get_aria_snapshot(page):
             const id = 'e' + index;
             index++;
 
-            // Assign ref to DOM element so playwright can click it via custom locator later
             el.setAttribute('data-ai-ref', id);
+
+            // Create a visual badge for the user to see what the agent is targeting
+            const badge = document.createElement('div');
+            badge.className = 'ai-som-badge';
+            badge.textContent = id;
+            badge.style.position = 'absolute';
+            badge.style.left = (rect.x + window.scrollX) + 'px';
+            badge.style.top = (rect.y + window.scrollY) + 'px';
+            badge.style.backgroundColor = 'rgba(255, 0, 0, 0.8)';
+            badge.style.color = 'white';
+            badge.style.fontSize = '12px';
+            badge.style.fontWeight = 'bold';
+            badge.style.padding = '2px 4px';
+            badge.style.borderRadius = '3px';
+            badge.style.zIndex = '999999';
+            badge.style.pointerEvents = 'none'; // so it doesn't block clicks
+            document.body.appendChild(badge);
 
             result.push({
                 ref: id,
@@ -99,14 +117,30 @@ async def execute_browser_action(
     try:
         if action == "navigate":
             await _page.goto(url, wait_until="networkidle")
-        elif action == "click":
-            # Find element by our injected data-ai-ref
+        elif action in ["click", "fill"]:
             element = _page.locator(f"[data-ai-ref='{ref}']")
-            await element.click()
-            await _page.wait_for_timeout(2000) # Give it time to react
-        elif action == "fill":
-            element = _page.locator(f"[data-ai-ref='{ref}']")
-            await element.fill(value)
+
+            # Highlight the element visually before acting
+            await element.evaluate("""(el) => {
+                el.style.outline = '4px solid yellow';
+                el.style.transition = 'outline 0.1s';
+            }""")
+            await _page.wait_for_timeout(500) # give user a chance to see
+
+            if action == "click":
+                await element.click()
+                await _page.wait_for_timeout(2000)
+            elif action == "fill":
+                await element.fill(value)
+
+            # Try to remove the outline if it hasn't navigated away
+            try:
+                await element.evaluate("""(el) => {
+                    el.style.outline = '';
+                }""")
+            except:
+                pass
+
         elif action == "scroll":
             if direction == "down":
                 await _page.evaluate("window.scrollBy(0, window.innerHeight)")
@@ -119,11 +153,9 @@ async def execute_browser_action(
         else:
             return f"Error: Unknown action '{action}'"
 
-        # Get new state
         current_url = _page.url
         current_aria = await get_aria_snapshot(_page)
 
-        # Dead-end check (if not just fill/extract text, and state didn't change)
         if action in ["navigate", "click", "scroll"]:
             if current_url == _last_url and current_aria == _last_aria:
                 _dead_ends.append(action_key)
